@@ -15,9 +15,10 @@ import { handleGit } from './git-http.ts';
 import { handleRest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { checkAuth, sendJson, sendError, notFound, type Ctx } from './context.ts';
+import { checkAuth, sendJson, sendError, notFound, parseRequestUrl, type Ctx } from './context.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024; // 64 MiB — packs from real git clients can be large
+const EMPTY_BODY = Buffer.alloc(0);
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -43,20 +44,22 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const method = req.method ?? 'GET';
-      let url: URL;
-      try {
-        url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-      } catch {
-        url = new URL('/', 'http://localhost');
-      }
-      const ctx: Ctx = { req, res, method, url, body: Buffer.alloc(0), expectedToken };
+      const url = parseRequestUrl(req.url ?? '/');
+      const ctx: Ctx = { req, res, method, url, body: EMPTY_BODY, expectedToken };
       try {
         // The health probe answers without auth and without reading a body.
         if (method === 'GET' && url.pathname === '/healthz') {
           sendJson(ctx, 200, { ok: true });
           return;
         }
-        ctx.body = await readBody(req);
+        // GET and HEAD never carry a body in this API: answer without waiting
+        // for the request stream's 'end' event (one event-loop turn per read).
+        // resume() drains any stray body bytes so the keep-alive socket stays clean.
+        if (method !== 'GET' && method !== 'HEAD') {
+          ctx.body = await readBody(req);
+        } else {
+          req.resume();
+        }
 
         // Every other surface requires the trial token.
         if (!checkAuth(ctx)) {

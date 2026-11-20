@@ -10,10 +10,11 @@ import {
   buildTree,
   parseTag,
   collectReachable,
-  isAncestor,
-  peelToCommit,
   type GitObject,
   type ObjectType,
+  type CommitInfo,
+  type TreeEntry,
+  type TagInfo,
 } from './git-core.ts';
 
 /** The viewer identity, fixed by the competition's deterministic scenario. */
@@ -107,6 +108,16 @@ export interface Repo {
   issues: Issue[];
   pulls: Pull[];
   nextNumber: number;
+  /** Bumped by setRef/deleteRef: caches keyed on refs (sorted lists, ads) read it. */
+  refVersion: number;
+  /** Parsed commits/trees/tags by oid. Objects are immutable once stored, so a
+   * parsed form never goes stale; the caches die with the repo. */
+  commitCache: Map<string, CommitInfo>;
+  treeCache: Map<string, TreeEntry[]>;
+  tagCache: Map<string, TagInfo>;
+  /** Issues and pulls by number: getIssue/getPull were linear scans. */
+  issuesByNumber: Map<number, Issue>;
+  pullsByNumber: Map<number, Pull>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,6 +153,12 @@ export function createRepo(
     issues: [],
     pulls: [],
     nextNumber: 1,
+    refVersion: 0,
+    commitCache: new Map(),
+    treeCache: new Map(),
+    tagCache: new Map(),
+    issuesByNumber: new Map(),
+    pullsByNumber: new Map(),
   };
   repos.set(key, repo);
   return repo;
@@ -179,6 +196,90 @@ export function lookupOf(repo: Repo): (oid: string) => GitObject | undefined {
   return (oid) => repo.objects.get(oid);
 }
 
+// ---------------------------------------------------------------------------------------------
+// cached parsing (objects are immutable, so parsed forms never go stale)
+// ---------------------------------------------------------------------------------------------
+
+/** A commit's parsed headers, cached per repo. Undefined when the oid is not a commit. */
+export function cachedCommit(repo: Repo, oid: string): CommitInfo | undefined {
+  const hit = repo.commitCache.get(oid);
+  if (hit) return hit;
+  const object = repo.objects.get(oid);
+  if (!object || object.type !== 'commit') return undefined;
+  const info = parseCommit(object.data);
+  repo.commitCache.set(oid, info);
+  return info;
+}
+
+/** A tree's parsed entries, cached per repo. Undefined when the oid is not a tree. */
+export function cachedTree(repo: Repo, oid: string): TreeEntry[] | undefined {
+  const hit = repo.treeCache.get(oid);
+  if (hit) return hit;
+  const object = repo.objects.get(oid);
+  if (!object || object.type !== 'tree') return undefined;
+  const entries = parseTree(object.data);
+  repo.treeCache.set(oid, entries);
+  return entries;
+}
+
+/** A tag's parsed headers, cached per repo. Undefined when the oid is not a tag. */
+export function cachedTag(repo: Repo, oid: string): TagInfo | undefined {
+  const hit = repo.tagCache.get(oid);
+  if (hit) return hit;
+  const object = repo.objects.get(oid);
+  if (!object || object.type !== 'tag') return undefined;
+  const info = parseTag(object.data);
+  repo.tagCache.set(oid, info);
+  return info;
+}
+
+/** Peel an annotated tag chain to the commit it points at, using the tag cache. */
+export function peelToCommitCached(repo: Repo, oid: string): string {
+  let current = oid;
+  for (let i = 0; i < 16; i++) {
+    const tag = cachedTag(repo, current);
+    if (!tag) return current;
+    current = tag.object;
+  }
+  return current;
+}
+
+/** True when `ancestor` is reachable from `tip` following commit parents (cached parses). */
+export function isAncestorCached(repo: Repo, tip: string, ancestor: string): boolean {
+  if (tip === ancestor) return true;
+  const seen = new Set<string>();
+  const queue = [tip];
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const commit = cachedCommit(repo, oid);
+    if (!commit) continue;
+    for (const parent of commit.parents) {
+      if (parent === ancestor) return true;
+      queue.push(parent);
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// refs (all mutations go through setRef/deleteRef so refVersion stays exact)
+// ---------------------------------------------------------------------------------------------
+
+/** Set a ref and bump the repo's ref version (invalidates ref-derived caches). */
+export function setRef(repo: Repo, ref: string, oid: string): void {
+  repo.refs.set(ref, oid);
+  repo.refVersion += 1;
+}
+
+/** Delete a ref and bump the repo's ref version when it existed. */
+export function deleteRef(repo: Repo, ref: string): boolean {
+  const had = repo.refs.delete(ref);
+  if (had) repo.refVersion += 1;
+  return had;
+}
+
 export function headRefName(repo: Repo): string {
   return `refs/heads/${repo.defaultBranch}`;
 }
@@ -196,26 +297,38 @@ export function resolveRef(repo: Repo, ref: string): string | undefined {
 }
 
 export function listBranches(repo: Repo): { name: string; sha: string }[] {
+  const cached = branchListCache.get(repo);
+  if (cached && cached.version === repo.refVersion) return cached.list;
   const out: { name: string; sha: string }[] = [];
   for (const [ref, sha] of repo.refs) {
     if (ref.startsWith('refs/heads/')) out.push({ name: ref.slice('refs/heads/'.length), sha });
   }
-  return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const sorted = out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  branchListCache.set(repo, { version: repo.refVersion, list: sorted });
+  return sorted;
 }
 
+// Branch/tag listings, cached per repo and invalidated by refVersion.
+const branchListCache = new WeakMap<Repo, { version: number; list: { name: string; sha: string }[] }>();
+const tagListCache = new WeakMap<Repo, { version: number; list: { name: string; sha: string }[] }>();
+
 export function listTags(repo: Repo): { name: string; sha: string }[] {
+  const cached = tagListCache.get(repo);
+  if (cached && cached.version === repo.refVersion) return cached.list;
   const out: { name: string; sha: string }[] = [];
   for (const [ref, sha] of repo.refs) {
     if (ref.startsWith('refs/tags/')) out.push({ name: ref.slice('refs/tags/'.length), sha });
   }
-  return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const sorted = out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  tagListCache.set(repo, { version: repo.refVersion, list: sorted });
+  return sorted;
 }
 
 /** The commit a ref points at (peeling annotated tags). Undefined when the ref is unborn. */
 export function refCommit(repo: Repo, ref: string): string | undefined {
   const oid = resolveRef(repo, ref);
   if (!oid) return undefined;
-  return peelToCommit(lookupOf(repo), oid);
+  return peelToCommitCached(repo, oid);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -231,9 +344,9 @@ export interface FlatEntry {
 export function flattenTree(repo: Repo, treeOid: string): Map<string, FlatEntry> {
   const out = new Map<string, FlatEntry>();
   const walk = (oid: string, prefix: string): void => {
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'tree') return;
-    for (const entry of parseTree(object.data)) {
+    const entries = cachedTree(repo, oid);
+    if (!entries) return;
+    for (const entry of entries) {
       const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
       if (entry.mode === '40000') walk(entry.oid, path);
       else out.set(path, { oid: entry.oid, mode: entry.mode });
@@ -288,9 +401,9 @@ export function buildTreeFromMap(repo: Repo, files: Map<string, FlatEntry>): str
 /** The tree oid of a commit, or the empty tree when the repo is unborn. */
 export function commitTree(repo: Repo, commitOid: string | undefined): string {
   if (!commitOid) return putObject(repo, 'tree', buildTree([]));
-  const object = repo.objects.get(peelToCommit(lookupOf(repo), commitOid));
-  if (!object || object.type !== 'commit') return putObject(repo, 'tree', buildTree([]));
-  return parseCommit(object.data).tree;
+  const commit = cachedCommit(repo, peelToCommitCached(repo, commitOid));
+  if (!commit) return putObject(repo, 'tree', buildTree([]));
+  return commit.tree;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -312,7 +425,7 @@ export function commitOnBranch(
   let parent = repo.refs.get(ref);
   if (!parent) {
     parent = repo.refs.get(headRefName(repo));
-    if (parent) parent = peelToCommit(lookupOf(repo), parent);
+    if (parent) parent = peelToCommitCached(repo, parent);
   }
   const parentTree = commitTree(repo, parent);
   const files = flattenTree(repo, parentTree);
@@ -328,7 +441,7 @@ export function commitOnBranch(
     extra: [],
   });
   const oid = putObject(repo, 'commit', commit);
-  repo.refs.set(ref, oid);
+  setRef(repo, ref, oid);
   repo.updatedAt = nowIso();
   return oid;
 }
@@ -338,15 +451,15 @@ export function walkCommits(repo: Repo, tip: string | undefined, limit = 1000): 
   if (!tip) return [];
   const out: string[] = [];
   const seen = new Set<string>();
-  const queue = [peelToCommit(lookupOf(repo), tip)];
+  const queue = [peelToCommitCached(repo, tip)];
   while (queue.length && out.length < limit) {
     const oid = queue.shift()!;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') continue;
+    const commit = cachedCommit(repo, oid);
+    if (!commit) continue;
     out.push(oid);
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    for (const parent of commit.parents) queue.push(parent);
   }
   return out;
 }
@@ -354,17 +467,17 @@ export function walkCommits(repo: Repo, tip: string | undefined, limit = 1000): 
 /** The best common ancestor of two commits (first hit walking head's history BFS). */
 export function mergeBase(repo: Repo, a: string | undefined, b: string | undefined): string | undefined {
   if (!a || !b) return undefined;
-  const aPeeled = peelToCommit(lookupOf(repo), a);
-  const bPeeled = peelToCommit(lookupOf(repo), b);
+  const aPeeled = peelToCommitCached(repo, a);
+  const bPeeled = peelToCommitCached(repo, b);
   const aAncestors = new Set<string>();
   const queue = [aPeeled];
   while (queue.length) {
     const oid = queue.shift()!;
     if (aAncestors.has(oid)) continue;
     aAncestors.add(oid);
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    const commit = cachedCommit(repo, oid);
+    if (!commit) continue;
+    for (const parent of commit.parents) queue.push(parent);
   }
   const queueB = [bPeeled];
   const seenB = new Set<string>();
@@ -373,9 +486,9 @@ export function mergeBase(repo: Repo, a: string | undefined, b: string | undefin
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     if (aAncestors.has(oid)) return oid;
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queueB.push(parent);
+    const commit = cachedCommit(repo, oid);
+    if (!commit) continue;
+    for (const parent of commit.parents) queueB.push(parent);
   }
   return undefined;
 }
@@ -506,7 +619,7 @@ export function squashMerge(repo: Repo, pull: Pull): string | null {
     extra: [],
   });
   const oid = putObject(repo, 'commit', commit);
-  repo.refs.set(`refs/heads/${pull.base}`, oid);
+  setRef(repo, `refs/heads/${pull.base}`, oid);
   repo.updatedAt = nowIso();
   return oid;
 }
@@ -514,10 +627,9 @@ export function squashMerge(repo: Repo, pull: Pull): string | null {
 export function isFastForward(repo: Repo, oldOid: string, newOid: string): boolean {
   if (oldOid === ZERO_OID) return true;
   if (oldOid === newOid) return true;
-  const lookup = lookupOf(repo);
-  const oldCommit = peelToCommit(lookup, oldOid);
-  const newCommit = peelToCommit(lookup, newOid);
-  return isAncestor(lookup, newCommit, oldCommit);
+  const oldCommit = peelToCommitCached(repo, oldOid);
+  const newCommit = peelToCommitCached(repo, newOid);
+  return isAncestorCached(repo, newCommit, oldCommit);
 }
 
 export { collectReachable };
@@ -546,11 +658,12 @@ export function createIssue(
     comments: [],
   };
   repo.issues.push(issue);
+  repo.issuesByNumber.set(issue.number, issue);
   return issue;
 }
 
 export function getIssue(repo: Repo, number: number): Issue | undefined {
-  return repo.issues.find((issue) => issue.number === number);
+  return repo.issuesByNumber.get(number);
 }
 
 export function createPull(
@@ -577,11 +690,12 @@ export function createPull(
     updatedAt: nowIso(),
   };
   repo.pulls.push(pull);
+  repo.pullsByNumber.set(pull.number, pull);
   return pull;
 }
 
 export function getPull(repo: Repo, number: number): Pull | undefined {
-  return repo.pulls.find((pull) => pull.number === number);
+  return repo.pullsByNumber.get(number);
 }
 
 export function addComment(issue: Issue, body: string): Comment {

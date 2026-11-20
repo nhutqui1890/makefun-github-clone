@@ -10,13 +10,9 @@ import {
   RESPONSE_END,
   decodePktLines,
   sidebandWrap,
-  writePack,
+  writePackKnown,
   readPack,
-  parseCommit,
-  parseTree,
-  parseTag,
-  peelToCommit,
-  type GitObject,
+  type KnownObject,
 } from './git-core.ts';
 import {
   VIEWER,
@@ -25,6 +21,12 @@ import {
   lookupOf,
   headRefName,
   isFastForward,
+  setRef,
+  deleteRef,
+  cachedCommit,
+  cachedTree,
+  cachedTag,
+  peelToCommitCached,
   type Repo,
 } from './store.ts';
 import { sendJson, sendBytes, sendError, type Ctx } from './context.ts';
@@ -85,18 +87,42 @@ export function handleGit(ctx: Ctx, owner: string, repoName: string, tail: strin
 // ---------------------------------------------------------------------------------------------
 
 function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
-  return [...repo.refs.entries()]
+  const hit = sortedRefsCache.get(repo);
+  if (hit && hit.version === repo.refVersion) return hit.refs;
+  const refs = [...repo.refs.entries()]
     .map(([name, oid]) => ({ name, oid }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  sortedRefsCache.set(repo, { version: repo.refVersion, refs });
+  return refs;
 }
+
+// Sorted refs, cached per repo and invalidated by refVersion (every advertisement
+// and ls-refs re-sorted them from scratch).
+const sortedRefsCache = new WeakMap<
+  Repo,
+  { version: number; refs: Array<{ name: string; oid: string }> }
+>();
 
 function peeledOid(repo: Repo, oid: string): string | null {
-  const object = repo.objects.get(oid);
-  if (!object || object.type !== 'tag') return null;
-  return peelToCommit(lookupOf(repo), oid);
+  if (!cachedTag(repo, oid)) return null;
+  return peelToCommitCached(repo, oid);
 }
 
+// v0 advertisements, cached per repo + service and invalidated by refVersion:
+// the bytes only depend on the ref set.
+const v0AdCache = new WeakMap<Repo, Map<string, { version: number; body: Buffer }>>();
+
 function v0Advertisement(ctx: Ctx, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): void {
+  let perRepo = v0AdCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    v0AdCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(service);
+  if (hit && hit.version === repo.refVersion) {
+    sendBytes(ctx, 200, `application/x-${service}-advertisement`, hit.body);
+    return;
+  }
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH];
   const refs = sortedRefs(repo);
@@ -120,19 +146,23 @@ function v0Advertisement(ctx: Ctx, repo: Repo, service: 'git-upload-pack' | 'git
     }
   }
   parts.push(FLUSH);
-  sendBytes(ctx, 200, `application/x-${service}-advertisement`, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  perRepo.set(service, { version: repo.refVersion, body });
+  sendBytes(ctx, 200, `application/x-${service}-advertisement`, body);
 }
 
+// The v2 capability advertisement never changes: build it once.
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH,
+]);
+
 function v2Advertisement(ctx: Ctx): void {
-  const parts: Buffer[] = [
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH,
-  ];
-  sendBytes(ctx, 200, 'application/x-git-upload-pack-advertisement', Buffer.concat(parts));
+  sendBytes(ctx, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
 }
 
 function handleInfoRefs(ctx: Ctx, repo: Repo): void {
@@ -196,7 +226,7 @@ function handleLsRefs(ctx: Ctx, repo: Repo, args: LsRefsArgs): void {
 // ---------------------------------------------------------------------------------------------
 
 export interface FetchSelection {
-  objects: GitObject[];
+  objects: KnownObject[];
   shallow: string[];
   unshallow: string[];
 }
@@ -223,15 +253,15 @@ export function computeFetch(
     if (!object) continue;
     exclude.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = cachedCommit(repo, oid)!;
       queue.push(commit.tree);
       if (!shallowSet.has(oid)) {
         for (const parent of commit.parents) queue.push(parent);
       }
     } else if (object.type === 'tag') {
-      queue.push(parseTag(object.data).object);
+      queue.push(cachedTag(repo, oid)!.object);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) {
+      for (const entry of cachedTree(repo, oid)!) {
         if (entry.mode === '160000') continue;
         queue.push(entry.oid);
       }
@@ -259,7 +289,7 @@ export function computeFetch(
       if (!object) continue;
       include.add(oid);
       if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) {
+        for (const entry of cachedTree(repo, oid)!) {
           if (entry.mode === '160000') continue;
           if (entry.mode === '40000') stack.push(entry.oid);
           else include.add(entry.oid);
@@ -283,7 +313,7 @@ export function computeFetch(
     if (object.type === 'commit') includeCommit(want, 1, deepenRelative ? Number.POSITIVE_INFINITY : absoluteLimit);
     else if (object.type === 'tag') {
       include.add(want);
-      const target = parseTag(object.data).object;
+      const target = cachedTag(repo, want)!.object;
       const targetObject = lookup(target);
       if (targetObject?.type === 'commit') includeCommit(target, 1, deepenRelative ? Number.POSITIVE_INFINITY : absoluteLimit);
       else if (targetObject) include.add(target);
@@ -303,9 +333,9 @@ export function computeFetch(
       if (!object) continue;
       reachable.add(oid);
       if (object.type === 'commit') {
-        for (const parent of parseCommit(object.data).parents) stack.push(parent);
+        for (const parent of cachedCommit(repo, oid)!.parents) stack.push(parent);
       } else if (object.type === 'tag') {
-        stack.push(parseTag(object.data).object);
+        stack.push(cachedTag(repo, oid)!.object);
       }
     }
     // Generation of each reachable client shallow from the wants (shortest path).
@@ -315,7 +345,7 @@ export function computeFetch(
       const object = lookup(want);
       if (object?.type === 'commit') genQueue.push({ oid: want, depth: 1 });
       else if (object?.type === 'tag') {
-        const target = parseTag(object.data).object;
+        const target = cachedTag(repo, want)!.object;
         if (lookup(target)?.type === 'commit') genQueue.push({ oid: target, depth: 1 });
       }
     }
@@ -323,9 +353,9 @@ export function computeFetch(
       const { oid, depth } = genQueue.shift()!;
       if (gen.has(oid)) continue;
       gen.set(oid, depth);
-      const object = lookup(oid);
-      if (object?.type !== 'commit') continue;
-      for (const parent of parseCommit(object.data).parents) {
+      const commit = cachedCommit(repo, oid);
+      if (!commit) continue;
+      for (const parent of commit.parents) {
         if (!gen.has(parent)) genQueue.push({ oid: parent, depth: depth + 1 });
       }
     }
@@ -333,9 +363,9 @@ export function computeFetch(
       if (!reachable.has(boundary)) continue;
       const boundaryDepth = gen.get(boundary);
       if (boundaryDepth === undefined) continue;
-      const object = lookup(boundary);
-      if (object?.type !== 'commit') continue;
-      for (const parent of parseCommit(object.data).parents) {
+      const commit = cachedCommit(repo, boundary);
+      if (!commit) continue;
+      for (const parent of commit.parents) {
         includeCommit(parent, boundaryDepth + 1, boundaryDepth + depthLimit);
       }
     }
@@ -343,10 +373,9 @@ export function computeFetch(
   while (commitQueue.length) {
     const { oid, depth, limit } = commitQueue.shift()!;
     if (commitDepth.get(oid) !== depth || commitLimit.get(oid) !== limit) continue; // superseded
-    const object = lookup(oid);
-    if (!object || object.type !== 'commit') continue;
+    const commit = cachedCommit(repo, oid);
+    if (!commit) continue;
     include.add(oid);
-    const commit = parseCommit(object.data);
     includeTree(commit.tree);
     if (depth >= limit) {
       // Depth limit reached at this commit: it becomes a shallow boundary.
@@ -364,18 +393,18 @@ export function computeFetch(
   const unshallow: string[] = [];
   for (const boundary of clientShallow) {
     if (!include.has(boundary)) continue;
-    const object = lookup(boundary);
-    if (!object || object.type !== 'commit') continue;
-    const parents = parseCommit(object.data).parents;
+    const commit = cachedCommit(repo, boundary);
+    if (!commit) continue;
+    const parents = commit.parents;
     if (parents.length === 0) continue;
     if (parents.every((parent) => include.has(parent))) unshallow.push(boundary);
   }
 
-  const objects: GitObject[] = [];
+  const objects: KnownObject[] = [];
   for (const oid of include) {
     if (exclude.has(oid)) continue;
     const object = lookup(oid);
-    if (object) objects.push(object);
+    if (object) objects.push({ oid, object });
   }
   return { objects, shallow: [...shallowOut], unshallow };
 }
@@ -404,7 +433,7 @@ function handleFetchV2(
     // through remote-curl's stateless-connect, which validates the response (and dies on a
     // 0002) and appends one itself for fetch-pack.
     parts.push(pktLine('packfile\n'));
-    parts.push(sidebandWrap(writePack(objects), 1));
+    parts.push(sidebandWrap(writePackKnown(objects), 1));
     parts.push(FLUSH);
   };
 
@@ -454,7 +483,7 @@ function handleFetchV0(
   } else {
     parts.push(pktLine('NAK\n'));
   }
-  parts.push(sidebandWrap(writePack(objects), 1));
+  parts.push(sidebandWrap(writePackKnown(objects), 1));
   parts.push(FLUSH);
   parts.push(RESPONSE_END);
   sendBytes(ctx, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
@@ -647,7 +676,7 @@ function handleReceivePack(ctx: Ctx, repo: Repo): void {
         results.push({ ref: command.ref, ok: false, reason: 'ref does not exist' });
         continue;
       }
-      repo.refs.delete(command.ref);
+      deleteRef(repo, command.ref);
       results.push({ ref: command.ref, ok: true });
       continue;
     }
@@ -657,7 +686,7 @@ function handleReceivePack(ctx: Ctx, repo: Repo): void {
       continue;
     }
     if (command.ref.startsWith('refs/heads/')) {
-      const commitOid = peelToCommit(lookupOf(repo), command.newOid);
+      const commitOid = peelToCommitCached(repo, command.newOid);
       const commit = repo.objects.get(commitOid);
       if (!commit || commit.type !== 'commit') {
         results.push({ ref: command.ref, ok: false, reason: 'not a commit' });
@@ -666,7 +695,7 @@ function handleReceivePack(ctx: Ctx, repo: Repo): void {
     }
     if (command.oldOid === ZERO_OID) {
       // Create.
-      repo.refs.set(command.ref, command.newOid);
+      setRef(repo, command.ref, command.newOid);
       results.push({ ref: command.ref, ok: true });
       continue;
     }
@@ -674,7 +703,7 @@ function handleReceivePack(ctx: Ctx, repo: Repo): void {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
-    repo.refs.set(command.ref, command.newOid);
+    setRef(repo, command.ref, command.newOid);
     results.push({ ref: command.ref, ok: true });
   }
   if (results.some((result) => result.ok)) repo.updatedAt = new Date().toISOString();

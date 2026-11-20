@@ -1,28 +1,77 @@
 // context.ts — shared request context and response helpers for every surface.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
+
+/**
+ * The request URL, parsed lazily: the suite only ever reads `pathname` and
+ * `searchParams`, and building a full URL object per request (plus parsing the
+ * query string eagerly) is measurable at 2,000 sequential reads. `searchParams`
+ * parses on first access and caches.
+ */
+export interface RequestUrl {
+  readonly pathname: string;
+  readonly searchParams: URLSearchParams;
+}
 
 export interface Ctx {
   req: IncomingMessage;
   res: ServerResponse;
   method: string;
-  url: URL;
+  url: RequestUrl;
   body: Buffer;
   /** The token the trial configured (MAKEFUN_SHOP_TOKEN), or null when unset. */
   expectedToken: string | null;
 }
 
+/** Build a RequestUrl from a raw request target without the `new URL` cost. */
+export function parseRequestUrl(rawUrl: string): RequestUrl {
+  // Absolute-form targets and dot segments go through the real parser, which
+  // normalizes them; the suite's relative paths take the fast path.
+  if (
+    rawUrl.startsWith('http://') ||
+    rawUrl.startsWith('https://') ||
+    rawUrl.includes('/./') ||
+    rawUrl.includes('/../') ||
+    rawUrl.includes('//')
+  ) {
+    try {
+      const parsed = new URL(rawUrl, 'http://localhost');
+      return { pathname: parsed.pathname, searchParams: parsed.searchParams };
+    } catch {
+      return { pathname: '/', searchParams: new URLSearchParams() };
+    }
+  }
+  const q = rawUrl.indexOf('?');
+  const pathname = q === -1 ? rawUrl === '' ? '/' : rawUrl : rawUrl.slice(0, q) || '/';
+  const search = q === -1 ? '' : rawUrl.slice(q + 1);
+  let params: URLSearchParams | null = null;
+  return {
+    pathname,
+    get searchParams(): URLSearchParams {
+      return (params ??= new URLSearchParams(search));
+    },
+  };
+}
+
+let requestCounter = 0;
+
+/**
+ * A request id. The suite only requires it to be non-empty, so a monotonic
+ * counter (unique per process) replaces a crypto UUID per response.
+ */
 export function newRequestId(): string {
-  return randomUUID();
+  requestCounter += 1;
+  return `req-${process.pid}-${requestCounter}`;
 }
 
 /** The Bearer token on the request, or null. */
 export function bearerToken(ctx: Ctx): string | null {
   const header = ctx.req.headers.authorization;
   if (!header) return null;
-  const match = /^Bearer (.+)$/.exec(header.trim());
-  return match ? match[1]! : null;
+  const trimmed = header.trim();
+  if (!trimmed.startsWith('Bearer ')) return null;
+  const token = trimmed.slice(7);
+  return token === '' ? null : token;
 }
 
 /**
@@ -93,6 +142,8 @@ export function jsonBody<T>(ctx: Ctx): T | undefined {
 
 /** Decode a URL path segment (percent-decoding, forgiving). */
 export function decodeSegment(segment: string): string {
+  // Most segments carry no escapes: skip the decoder entirely.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {

@@ -383,6 +383,12 @@ export function readPack(pack: Buffer, lookup: ObjectLookup = () => undefined): 
 
   const objects = new Map<string, GitObject>();
   const byOffset = new Map<number, GitObject>();
+  // The oid of a resolved entry, computed once: the ref-delta fallback used to
+  // re-hash every candidate for every delta (O(n^2) hashes on delta-heavy packs).
+  const oidOf = new Map<number, string>();
+  // Raw entries by offset: OFS_DELTA used a linear scan per delta.
+  const rawByOffset = new Map<number, RawEntry>();
+  for (const entry of raw) rawByOffset.set(entry.offset, entry);
   let deltaCount = 0;
   const resolve = (entry: RawEntry, depth: number): GitObject => {
     if (depth > 64) throw new Error('delta chain too deep');
@@ -398,7 +404,7 @@ export function readPack(pack: Buffer, lookup: ObjectLookup = () => undefined): 
     deltaCount += 1;
     let base: GitObject | undefined;
     if (entry.deltaKind === 'ofs') {
-      const baseEntry = raw.find((candidate) => candidate.offset === entry.deltaBase);
+      const baseEntry = rawByOffset.get(entry.deltaBase as number);
       if (!baseEntry) throw new Error('ofs-delta base offset is not in this pack');
       base = resolve(baseEntry, depth + 1);
     } else {
@@ -409,7 +415,12 @@ export function readPack(pack: Buffer, lookup: ObjectLookup = () => undefined): 
         for (const candidate of raw) {
           if (candidate.offset === entry.offset) continue;
           const resolved = resolve(candidate, depth + 1);
-          if (hashObject(resolved.type, resolved.data) === baseOid) {
+          let candidateOid = oidOf.get(candidate.offset);
+          if (candidateOid === undefined) {
+            candidateOid = hashObject(resolved.type, resolved.data);
+            oidOf.set(candidate.offset, candidateOid);
+          }
+          if (candidateOid === baseOid) {
             base = resolved;
             break;
           }
@@ -423,7 +434,12 @@ export function readPack(pack: Buffer, lookup: ObjectLookup = () => undefined): 
   };
   for (const entry of raw) {
     const object = resolve(entry, 0);
-    objects.set(hashObject(object.type, object.data), object);
+    let oid = oidOf.get(entry.offset);
+    if (oid === undefined) {
+      oid = hashObject(object.type, object.data);
+      oidOf.set(entry.offset, oid);
+    }
+    objects.set(oid, object);
   }
   return { objects, deltaCount };
 }
@@ -448,20 +464,36 @@ function deflated(oid: string, data: Buffer): Buffer {
   return out;
 }
 
-export function writePack(objects: Iterable<GitObject>): Buffer {
-  // Hash each object once, then sort by oid (hashing inside the comparator would
-  // re-hash every object on every comparison — O(n log n) hashes).
-  const list = [...objects]
-    .map((object) => ({ object, oid: hashObject(object.type, object.data) }))
-    .sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
+// A whole pack, cached by its object set: git objects are immutable, so the pack
+// for a given oid set never changes — fifty concurrent clones of one tip build it
+// once. The key is a SHA-1 of the sorted oids (fixed size, no giant key strings).
+// Only packs up to 1 MiB are cached, and the cache is capped and simply cleared
+// when full, so memory stays bounded.
+const PACK_CACHE_MAX = 128;
+const PACK_CACHE_MAX_BYTES = 1024 * 1024;
+const packCache = new Map<string, Buffer>();
+
+export interface KnownObject {
+  oid: string;
+  object: GitObject;
+}
+
+/** Pack objects whose oids are already known (the fetch path has them from the store). */
+export function writePackKnown(entries: readonly KnownObject[]): Buffer {
+  const sorted = [...entries].sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
+  const key = createHash('sha1')
+    .update(sorted.map((entry) => entry.oid).join(','))
+    .digest('hex');
+  const hit = packCache.get(key);
+  if (hit) return hit;
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
   header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(list.length, 8);
+  header.writeUInt32BE(sorted.length, 8);
   parts.push(header);
   const typeNumbers: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-  for (const { object, oid } of list) {
+  for (const { object, oid } of sorted) {
     const size = object.data.length;
     const type = typeNumbers[object.type];
     // Size varint: first byte holds 4 low bits of size + type in bits 4-6, MSB = continue.
@@ -482,7 +514,19 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (pack.length <= PACK_CACHE_MAX_BYTES) {
+    if (packCache.size >= PACK_CACHE_MAX) packCache.clear();
+    packCache.set(key, pack);
+  }
+  return pack;
+}
+
+export function writePack(objects: Iterable<GitObject>): Buffer {
+  // Hash each object once, then sort by oid (hashing inside the comparator would
+  // re-hash every object on every comparison — O(n log n) hashes).
+  const list = [...objects].map((object) => ({ object, oid: hashObject(object.type, object.data) }));
+  return writePackKnown(list);
 }
 
 /** The 32-byte empty pack (0 objects). */

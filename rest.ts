@@ -1,7 +1,6 @@
 // rest.ts — GitHub REST API v3 surface: repos, branches, commits, git refs, contents,
 // labels, issues, comments and pull requests.
 
-import { parseCommit } from './git-core.ts';
 import { buildCommit } from './git-core.ts';
 import {
   VIEWER,
@@ -28,6 +27,8 @@ import {
   addComment,
   buildTreeFromMap,
   viewerIdent,
+  cachedCommit,
+  setRef,
   type Repo,
   type Issue,
   type Pull,
@@ -111,9 +112,8 @@ function pullShape(repo: Repo, pull: Pull): Record<string, unknown> {
 }
 
 function commitShape(repo: Repo, sha: string): Record<string, unknown> | null {
-  const object = getObject(repo, sha);
-  if (!object || object.type !== 'commit') return null;
-  const commit = parseCommit(object.data);
+  const commit = cachedCommit(repo, sha);
+  if (!commit) return null;
   const author = commit.author.replace(/ \d+ [+-]\d{4}$/, '');
   // Git stores the message with a trailing newline; GitHub's API answers without it.
   const message = commit.message.replace(/\r?\n$/, '');
@@ -423,7 +423,7 @@ function handleGitRefs(ctx: Ctx, method: string, owner: string, name: string, ta
       sendError(ctx, 422, 'Object does not exist');
       return;
     }
-    repo.refs.set(ref, sha);
+    setRef(repo, ref, sha);
     sendJson(ctx, 201, { ref, object: { sha, type: target.type } });
     return;
   }
@@ -850,7 +850,7 @@ function mergeCommit(
     extra: [],
   });
   const oid = putObject(repo, 'commit', commit);
-  repo.refs.set(`refs/heads/${pull.base}`, oid);
+  setRef(repo, `refs/heads/${pull.base}`, oid);
   repo.updatedAt = new Date().toISOString();
   return oid;
 }
